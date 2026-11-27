@@ -1,0 +1,101 @@
+name: Publish news preview
+
+on:
+  repository_dispatch:
+    types:
+      - wiki-news-changed
+
+concurrency:
+  group: publish-news-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      ARTICLE_ID: ${{ github.event.client_payload.article_id }}
+      OPERATION: ${{ github.event.client_payload.operation }}
+    steps:
+      - name: Check out Pages site
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Validate event payload
+        shell: bash
+        run: |
+          if [[ -z "$ARTICLE_ID" || "$ARTICLE_ID" == "." || "$ARTICLE_ID" == ".." || "$ARTICLE_ID" == *"/"* ]]; then
+            echo "::error::Invalid article_id in repository_dispatch payload"
+            exit 1
+          fi
+
+          case "$OPERATION" in
+            created|updated|deleted) ;;
+            *)
+              echo "::error::Invalid operation in repository_dispatch payload"
+              exit 1
+              ;;
+          esac
+
+          ARTICLE_SEGMENT="$(node -e 'process.stdout.write(encodeURIComponent(process.env.ARTICLE_ID).replace(/\./g, "%2E"))')"
+          printf 'ARTICLE_SEGMENT=%s\n' "$ARTICLE_SEGMENT" >> "$GITHUB_ENV"
+
+      - name: Clone public Development repository
+        if: env.OPERATION != 'deleted'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch master \
+            https://github.com/OrangeGamesProduction/Moonlight-Fracture-Site-Development.git \
+            "$RUNNER_TEMP/Moonlight-Fracture-Site-Development"
+
+      - name: Generate article preview
+        if: env.OPERATION != 'deleted'
+        shell: bash
+        run: |
+          node "$RUNNER_TEMP/Moonlight-Fracture-Site-Development/scripts/generate-news-previews.mjs" \
+            --article-id "$ARTICLE_ID" \
+            --output-dir "$GITHUB_WORKSPACE/news"
+
+      - name: Remove deleted article preview
+        if: env.OPERATION == 'deleted'
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const root = path.resolve(process.env.GITHUB_WORKSPACE, "news");
+          const target = path.resolve(root, process.env.ARTICLE_SEGMENT);
+          if (path.dirname(target) !== root) {
+            throw new Error("Refusing to remove a path outside the news directory");
+          }
+
+          try {
+            const stat = fs.lstatSync(target);
+            if (stat.isSymbolicLink() || !stat.isDirectory()) {
+              throw new Error(`Refusing to remove unexpected preview path: ${target}`);
+            }
+            fs.rmSync(target, { recursive: true });
+          } catch (error) {
+            if (error.code !== "ENOENT") {
+              throw error;
+            }
+          }
+          NODE
+
+      - name: Commit and publish generated changes
+        shell: bash
+        run: |
+          git add -A -- "news/$ARTICLE_SEGMENT"
+          if git diff --cached --quiet; then
+            echo "No preview changes to publish."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Publish news preview for $ARTICLE_ID"
+          git push origin HEAD:master
